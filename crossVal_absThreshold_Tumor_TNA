@@ -1,0 +1,283 @@
+library(tidyverse)
+library(caret)
+library(survival)
+library(survminer)
+library(dplyr)
+
+safe_dir <- function(path) {
+  dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  invisible(path)
+}
+
+one_sided_p <- function(z, p_two_sided, alternative = c("greater", "less")) {
+  alternative <- match.arg(alternative)
+  # "greater" means z > 0 is evidence; "less" means z < 0 is evidence
+  if (is.na(z) || is.na(p_two_sided)) return(NA_real_)
+  if (alternative == "greater") {
+    if (z >= 0) return(p_two_sided / 2) else return(1)
+  } else {
+    if (z <= 0) return(p_two_sided / 2) else return(1)
+  }
+}
+
+# discovery
+
+data0 <- read.csv("376_469_NO_MET_DISCOVERY(Sheet1).csv")
+
+vals <- data0$Tumor.Events.in.px.mm.2.redundant
+vals <- vals + 1
+
+valid_idxs <- which(is.finite(vals))
+vals[!is.finite(vals)] <- 0
+
+qNorm = 0.7
+qTrainValsNorm = quantile(vals, probs = qNorm, na.rm = TRUE)
+vals  = (vals / qVValsNorm) * qTrainValsNorm
+
+PFS_idx  <- data0$PFS_Index_2Years
+PFS_days <- data0$PFS_2Years
+
+data0$vals  <- vals
+data0$event <- PFS_idx
+data0$time  <- PFS_days
+
+data <- data0[valid_idxs, , drop = FALSE]
+
+set.seed(67676767)
+
+### Cross-validation
+
+nFold     <- 10
+prop_test <- 0.5
+propLevels <- seq(0.10, 0.57, by = 0.05)
+nLevel <- length(propLevels)
+
+# Output containers
+fold_thres_all       <- rep(NA_real_, nFold)
+fold_quantiles_all   <- rep(NA_real_, nFold)
+fold_hr_all          <- rep(NA_real_, nFold)
+fold_pvals_all       <- rep(NA_real_, nFold)
+fold_hr_all_test     <- rep(NA_real_, nFold)
+fold_pvals_all_test  <- rep(NA_real_, nFold)
+
+fold_hr_all_test_mat <- matrix(NA_real_, nFold, nLevel)
+
+### Output directory
+
+outdir <- safe_dir("KM_Plots_ThresholdSplits_AllProps_Tumor")
+one_sided_alt <- "greater"  # keep "greater" for hypothesis HR(groupLow) > 1
+
+### CV loop
+
+for (cFold in seq_len(nFold)) {
+  
+  set.seed(123 + cFold)
+  
+  idx_event    <- sample(which(data$event == 1))
+  idx_nonevent <- sample(which(data$event == 0))
+  
+  n_event_test    <- round(length(idx_event) * prop_test)
+  n_nonevent_test <- round(length(idx_nonevent) * prop_test)
+  
+  test_idx <- c(
+    idx_event[seq_len(min(n_event_test, length(idx_event)))],
+    idx_nonevent[seq_len(min(n_nonevent_test, length(idx_nonevent)))]
+  )
+  
+  train_idx  <- setdiff(seq_len(nrow(data)), test_idx)
+  train_data <- data[train_idx, , drop = FALSE]
+  test_data  <- data[test_idx,  , drop = FALSE]
+  
+  # Per-threshold storage for this fold
+  levels_vec <- rep(NA_real_, nLevel)
+  pvals      <- rep(NA_real_, nLevel)
+  hrs        <- rep(NA_real_, nLevel)
+  
+  pvals_test <- rep(NA_real_, nLevel)
+  hrs_test   <- rep(NA_real_, nLevel)
+  
+  for (i in seq_len(nLevel)) {
+    
+    cat("Fold:", cFold, "Level:", i, "\n")
+    
+    # Threshold derived from train only
+    q <- quantile(train_data$vals, probs = 1 - propLevels[i], na.rm = TRUE)
+    
+    # Train groups
+    group_train <- ifelse(train_data$vals < q, "Low", "High")
+    group_train <- factor(group_train, levels = c("High", "Low"))  # High ref
+    if (nlevels(droplevels(group_train)) < 2) next
+    train_data$group <- group_train
+    
+    # Test groups (using same q)
+    group_test <- ifelse(test_data$vals < q, "Low", "High")
+    group_test <- factor(group_test, levels = c("High", "Low"))
+    if (nlevels(droplevels(group_test)) < 2) next
+    test_data$group <- group_test
+    
+    # KM plot (train)
+    fit <- survfit(Surv(time, event) ~ group, data = train_data)
+    
+    p <- ggsurvplot(
+      fit,
+      data = train_data,
+      pval = TRUE,
+      risk.table = TRUE,
+      legend.title = "Marker Group",
+      legend.labs = c("High", "Low"),
+      palette = c("firebrick", "steelblue"),
+      title = paste0(
+        "Fold ", cFold,
+        " | Quantile ", formatC(propLevels[i], format = "f", digits = 2),
+        " | Threshold ", formatC(q, format = "f", digits = 2)
+      )
+    )
+    
+    out_plot <- file.path(
+      outdir,
+      paste0(
+        "KM_fold_", cFold,
+        "_quantile_", formatC(propLevels[i], format = "f", digits = 2),
+        "_absolute_", formatC(q, format = "f", digits = 2),
+        ".pdf"
+      )
+    )
+    ggsave(out_plot, plot = p$plot, width = 6, height = 5)
+    
+    # Cox TRAIN
+    cox_train <- coxph(Surv(time, event) ~ group, data = train_data)
+    s_train <- summary(cox_train)
+    
+    z_train <- s_train$coefficients["groupLow", "z"]
+    p2_train <- s_train$coefficients["groupLow", "Pr(>|z|)"]
+    hr_train <- s_train$coefficients["groupLow", "exp(coef)"]
+    
+    hrs[i] <- hr_train
+    pvals[i] <- one_sided_p(z_train, p2_train, alternative = one_sided_alt)
+    levels_vec[i] <- q
+    
+    # Cox TEST
+    cox_test <- coxph(Surv(time, event) ~ group, data = test_data)
+    s_test <- summary(cox_test)
+    
+    z_test <- s_test$coefficients["groupLow", "z"]
+    p2_test <- s_test$coefficients["groupLow", "Pr(>|z|)"]
+    hr_test <- s_test$coefficients["groupLow", "exp(coef)"]
+    
+    hrs_test[i] <- hr_test
+    pvals_test[i] <- one_sided_p(z_test, p2_test, alternative = one_sided_alt)
+    
+    # Store "High vs Low" HR for test (your convention: 1/HR_lowvsHigh)
+    fold_hr_all_test_mat[cFold, i] <- 1 / hr_test
+  }
+  
+  valid <- which(is.finite(pvals_test) & pvals_test > 0 & is.finite(hrs_test))
+  
+  if (length(valid) == 0) {
+    next
+  }
+  
+  # choose minimum one-sided p-value among valid
+  selIdx <- valid[which.min(pvals_test[valid])]
+  
+  fold_thres_all[cFold]      <- levels_vec[selIdx]
+  fold_quantiles_all[cFold]  <- propLevels[selIdx]
+  
+  # store High vs Low HR (your convention: 1/hr_lowvsHigh)
+  fold_hr_all[cFold]         <- 1 / hrs[selIdx]
+  fold_pvals_all[cFold]      <- pvals[selIdx]
+  
+  fold_hr_all_test[cFold]    <- 1 / hrs_test[selIdx]
+  fold_pvals_all_test[cFold] <- pvals_test[selIdx]
+}
+
+### Summaries (drop folds that failed selection)
+
+keep <- which(is.finite(fold_hr_all_test) & is.finite(fold_hr_all))
+
+fold_thres_all[keep]
+fold_quantiles_all[keep]
+fold_hr_all[keep]
+fold_pvals_all[keep]
+fold_hr_all_test[keep]
+fold_pvals_all_test[keep]
+
+# HR tests (test)
+res_test <- t.test(fold_hr_all_test[keep], mu = 1)
+print(res_test)
+
+# HR tests (train)
+res_train <- t.test(fold_hr_all[keep], mu = 1)
+print(res_train)
+
+# abs threshold summary
+print(mean(fold_thres_all[keep], na.rm = TRUE))
+print(sd(fold_thres_all[keep], na.rm = TRUE))
+
+# proportion summary
+print(mean(fold_quantiles_all[keep], na.rm = TRUE))
+print(sd(fold_quantiles_all[keep], na.rm = TRUE))
+
+out_data <- data.frame(
+  fold = keep,
+  fold_thres_all      = fold_thres_all[keep],
+  fold_quantiles_all  = fold_quantiles_all[keep],
+  fold_hr_all         = fold_hr_all[keep],
+  fold_pvals_all      = fold_pvals_all[keep],
+  fold_hr_all_test    = fold_hr_all_test[keep],
+  fold_pvals_all_test = fold_pvals_all_test[keep]
+)
+
+write.csv(out_data, "out_data_Tumor_10Fold_50_50_onesided.csv", row.names = FALSE)
+
+# ### Derive final cutpoint from discovery and test on validation
+
+# Load validation
+val <- read.csv("719_NO_MET_VALIDATION(Sheet1).csv")
+
+vvals <- val$Tumor.Events.in.px.mm.2.redundant
+vvals <- vvals + 1
+valid2 <- which(is.finite(vvals))
+vvals[!is.finite(vvals)] <- 0
+
+val$vals  <- vvals
+val$event <- val$PFS_Index_2Years
+val$time  <- val$PFS_2Years
+
+val <- val[valid2, , drop = FALSE]
+
+# Apply cutpoint
+val$group <- ifelse(val$vals < q_final, "Low", "High")
+val$group <- factor(val$group, levels = c("High","Low"))
+
+if (nlevels(droplevels(val$group)) < 2) {
+  stop("Validation set collapses to a single group at the chosen threshold; cannot fit KM/Cox.")
+}
+
+# KM on validation
+fit_val <- survfit(Surv(time, event) ~ group, data = val)
+p_val <- ggsurvplot(
+  fit_val,
+  data = val,
+  pval = TRUE,
+  risk.table = TRUE,
+  legend.title = "Marker Group",
+  legend.labs = c("High", "Low"),
+  palette = c("firebrick", "steelblue"),
+  title = "Validation set"
+)
+print(p_val)
+
+# Cox on validation (one-sided)
+cox_val <- coxph(Surv(time, event) ~ group, data = val)
+s_val <- summary(cox_val)
+
+z_val  <- s_val$coefficients["groupLow", "z"]
+p2_val <- s_val$coefficients["groupLow", "Pr(>|z|)"]
+hr_val <- s_val$coefficients["groupLow", "exp(coef)"]
+
+p1_val <- one_sided_p(z_val, p2_val, alternative = one_sided_alt)
+
+cat("Validation HR (Low vs High):", hr_val, "\n")
+cat("Validation HR (High vs Low):", 1/hr_val, "\n")
+cat("Validation one-sided p:", p1_val, "\n")
